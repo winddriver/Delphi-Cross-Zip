@@ -70,7 +70,7 @@ const
   MAX_UINT32           = High(UInt32);
   MAX_COMMENT_SIZE     = $FFFF;        // 最大注释大小
 
-  BUF_SIZE = 256 * 1024; // 缓存大小(综合测试发现 32K 综合性能最好)
+  BUF_SIZE = 64 * 1024; // 缓存大小
 
 type
   /// <summary>
@@ -238,11 +238,14 @@ type
     SIGNATURE_ZIP64_END_HEADER:     UInt32 = $07064B50; // ZIP64 结束中心目录标志
     SIGNATURE_ZIP64_CENTRAL_HEADER: UInt32 = $06064B50; // ZIP64 中心目录定位器标志
     SIGNATURE_DESCRIPTOR:           UInt32 = $08074B50; // 数据描述符标志
+  protected class threadvar
+    FBuffer: array [0..BUF_SIZE-1] of Byte;
   private
     FUtf8: Boolean;
     FFileList: TList<PZipHeader>;
     FComment: TBytes;
     FPassword: TBytes;
+    FZipFileName: string;
     FZipStream: TStream;
     FOpenMode: TZipMode;
     FOwnedStream, FChanged: Boolean;
@@ -315,7 +318,7 @@ type
     procedure Open(const AZipFileStream: TStream; const AOpenMode: TZipMode; const AOwned: Boolean); overload;
 
     /// <summary>
-    ///   关闭 Zip 文件(注意: 如果传入了外部流, 并且 AOwned=True, 则 Close 之后该流也会被释放)
+    ///   关闭 Zip 文件(同时会自动保存)
     /// </summary>
     procedure Close;
 
@@ -645,7 +648,8 @@ type
     FStreamStartPos: Int64;
     FStreamPos: Int64;
     FZStream: TZStreamRec;
-    FBuffer: TBytes;
+  protected class threadvar
+    FBuffer: array [0..BUF_SIZE-1] of Byte;
   public
     constructor Create(const AStream: TStream; const AOwner: Boolean);
     destructor Destroy; override;
@@ -656,6 +660,8 @@ type
   public
     constructor Create(const AStream: TStream; const AOwner: Boolean;
       const ACompressLevel: Integer = Z_DEFAULT_COMPRESSION;
+      const AWindowBits: Integer = -15;
+      const AMemLevel: Integer = 8;
       const AStrategy: Integer = Z_DEFAULT_STRATEGY);
     destructor Destroy; override;
 
@@ -790,7 +796,7 @@ var
 begin
   LOffset := 0;
   LCount := Length(AExtraData);
-  while LOffset + SizeOf(TZipExtraField) < LCount do
+  while LOffset + SizeOf(TZipExtraField) <= LCount do
   begin
     LField := @AExtraData[LOffset];
     if LField.FieldId = AFieldId then
@@ -818,7 +824,7 @@ var
 begin
   LOffset := 0;
   LCount := Length(AExtraData);
-  while LOffset + SizeOf(TZipExtraField) < LCount do
+  while LOffset + SizeOf(TZipExtraField) <= LCount do
   begin
     LField := @AExtraData[LOffset];
     if LField.FieldId = AFieldId then
@@ -845,7 +851,7 @@ begin
   end;
   LOffset := 0;
   LCount := Length(AExtraData);
-  while LOffset + SizeOf(TZipExtraField) < LCount do
+  while LOffset + SizeOf(TZipExtraField) <= LCount do
   begin
     LField := @AExtraData[LOffset];
     LLen := SizeOf(TZipExtraField) + LField.FieldLen;
@@ -1098,7 +1104,7 @@ end;
 function TZipHeader.IsDirectory: Boolean;
 begin
   Result := (ExternalAttributes and faDirectory <> 0)
-    or (FileName[Length(FileName) - 1] in [Ord('\'), Ord('/')]);
+    or ((Length(FileName) > 0) and (FileName[Length(FileName) - 1] in [Ord('\'), Ord('/')]));
 end;
 
 function TZipHeader.IsUtf8FileName: Boolean;
@@ -1391,7 +1397,6 @@ var
   LDataSize, LStartPos, LRemained: Int64;
   LCompressedSize, LUncompressedSize: UInt64;
   LBlockSize: Integer;
-  LBuffer: TBytes;
 begin
   FZipStream.Position := FEndFileData;
 
@@ -1448,21 +1453,17 @@ begin
     if (LDataSize > 0) then
     begin
       LRemained := LDataSize;
-      if (LRemained > BUF_SIZE) then
-        SetLength(LBuffer, BUF_SIZE)
-      else
-        SetLength(LBuffer, LRemained);
       while (LRemained > 0) do
       begin
         // 读取一块数据
-        LBlockSize := AData.Read(LBuffer[0], Min(Length(LBuffer), LRemained));
+        LBlockSize := AData.Read(FBuffer[0], Min(Length(FBuffer), LRemained));
         if (LBlockSize <= 0) then Break;
 
         // 计算原始的 CRC32 值
-        ALocalHeader^.CRC32 := CRC32Calc(ALocalHeader^.CRC32, LBuffer[0], LBlockSize);
+        ALocalHeader^.CRC32 := CRC32Calc(ALocalHeader^.CRC32, FBuffer[0], LBlockSize);
 
         // 写入压缩数据流
-        LCompressStream.Write(LBuffer[0], LBlockSize);
+        LCompressStream.Write(FBuffer[0], LBlockSize);
 
         Dec(LRemained, LBlockSize);
       end;
@@ -1532,6 +1533,17 @@ begin
   
   Save;
   ClearFiles;
+
+  // 如果是打开的文件, 在关闭的时候释放文件流,
+  // 是为了防止外部代码在Zip对象Close之后, 释放之前打开文件出现占用异常;
+  // 之所以不在这里直接调用FreeOwnedStream,
+  // 是为了允许外部代码在Zip对象Close之后, 释放之前继续访问文件流
+  if (FZipFileName <> '') then
+  begin
+    FZipFileName := '';
+    if (FZipStream <> nil) then
+      FreeAndNil(FZipStream);
+  end;
 end;
 
 constructor TCrossZip.Create;
@@ -1607,7 +1619,6 @@ end;
 destructor TCrossZip.Destroy;
 begin
   Close;
-  ClearFiles;
   FreeAndNil(FFileList);
   FreeOwnedStream;
 
@@ -1622,7 +1633,6 @@ var
   LSignature: UInt32;
   LDecompressStream: TStream;
   LRemained: Int64;
-  LBuffer: TBytes;
   LBlockSize: Integer;
   LCrc32: UInt32;
   LNeedCheckCrc32: Boolean;
@@ -1698,22 +1708,18 @@ begin
     LRemained := LZipHeader.UncompressedSize;
 
     LCrc32 := 0;
-    if (LRemained > BUF_SIZE) then
-      SetLength(LBuffer, BUF_SIZE)
-    else
-      SetLength(LBuffer, LRemained);
     while (LRemained > 0) do
     begin
       // 读取一块数据(读取的同时自动解压)
-      LBlockSize := LDecompressStream.Read(LBuffer[0], Min(Length(LBuffer), LRemained));
+      LBlockSize := LDecompressStream.Read(FBuffer[0], Min(Length(FBuffer), LRemained));
       if (LBlockSize <= 0) then Break;
 
       // 计算原始的 CRC32 值
       if LNeedCheckCrc32 then
-        LCrc32 := CRC32Calc(LCrc32, LBuffer[0], LBlockSize);
+        LCrc32 := CRC32Calc(LCrc32, FBuffer[0], LBlockSize);
 
       // 写入解压后的数据
-      ADstStream.Write(LBuffer[0], LBlockSize);
+      ADstStream.Write(FBuffer[0], LBlockSize);
 
       Dec(LRemained, LBlockSize);
     end;
@@ -1951,6 +1957,7 @@ begin
   LFileStream := TFileStream.Create(AZipFileName, LMode);
   try
     Open(LFileStream, AOpenMode, True);
+    FZipFileName := AZipFileName;
   except
     FreeAndNil(LFileStream);
     raise;
@@ -2294,8 +2301,41 @@ class function TZipDefaultCompressionHandler.CreateCompressionStream(
   const AMethod: TZipCompressionMethod; const AOutStream: TStream;
   const AZipHeader: PZipHeader; const APassword: TBytes;
   const ACompressLevel, AStrategy: Integer): TStream;
+const
+  KB = 1024;
+  MB = 1024*1024;
+
+  procedure GetOptimalDeflateParams(const AFileSize: Int64;
+    out AWindowBits, AMemLevel: Integer);
+  begin
+    case AFileSize of
+      0..64*KB:         // < 64KB
+      begin
+        AWindowBits := -12;  // 4KB窗口
+        AMemLevel := 1;      // 2KB内存
+      end;
+
+      64*KB+1..512*KB:  // 64KB - 512KB
+      begin
+        AWindowBits := -13;  // 8KB窗口
+        AMemLevel := 6;      // 64KB内存
+      end;
+
+      512*KB+1..10*MB:  // 512KB - 10MB
+      begin
+        AWindowBits := -14; // 16KB窗口
+        AMemLevel := 8;     // 256KB内存
+      end;
+
+    else  // > 10MB
+      AWindowBits := -15;   // 32KB窗口
+      AMemLevel := 9;       // 512KB内存
+    end;
+  end;
+
 var
   LOutStream: TStream;
+  LWindowBits, LMemLevel: Integer;
   LAESExtraField: TAESExtraField;
 begin
   Result := nil;
@@ -2319,10 +2359,13 @@ begin
         else
           LOutStream := AOutStream;
 
+        GetOptimalDeflateParams(AZipHeader.UncompressedSize, LWindowBits, LMemLevel);
         Result := TDeflateCompressStream.Create(
           LOutStream,
           (LOutStream <> AOutStream),
           ACompressLevel,
+          LWindowBits,
+          LMemLevel,
           AStrategy);
       end;
 
@@ -2349,10 +2392,13 @@ begin
             begin
               // AES 加密数据流
               LOutStream := TZipAESEncryptStream.Create(AOutStream, APassword, AZipHeader, LAESExtraField);
+              GetOptimalDeflateParams(AZipHeader.UncompressedSize, LWindowBits, LMemLevel);
               Result := TDeflateCompressStream.Create(
                 LOutStream,
                 (LOutStream <> AOutStream),
                 ACompressLevel,
+                LWindowBits,
+                LMemLevel,
                 AStrategy);
             end;
         end;
@@ -2466,7 +2512,6 @@ begin
   FStream := AStream;
   FStreamStartPos := AStream.Position;
   FStreamPos := FStreamStartPos;
-  SetLength(FBuffer, BUF_SIZE);
 end;
 
 destructor TCustomDeflateStream.Destroy;
@@ -2479,7 +2524,7 @@ end;
 { TDeflateCompressStream }
 
 constructor TDeflateCompressStream.Create(const AStream: TStream;
-  const AOwner: Boolean; const ACompressLevel, AStrategy: Integer);
+  const AOwner: Boolean; const ACompressLevel, AWindowBits, AMemLevel, AStrategy: Integer);
 begin
   inherited Create(AStream, AOwner);
 
@@ -2554,8 +2599,8 @@ int strategy
     FZStream,
     ACompressLevel,
     Z_DEFLATED,
-    {$IFDEF SUPPORT_ZLIB_WINDOWBITS}-15{$ELSE}15{$ENDIF},
-    9,
+    AWindowBits,
+    AMemLevel,
     AStrategy
   );
 end;
@@ -2638,7 +2683,7 @@ begin
 
   inflateInit2(
     FZStream,
-    {$IFDEF SUPPORT_ZLIB_WINDOWBITS}-15{$ELSE}15{$ENDIF});
+    -15);
 end;
 
 destructor TDeflateDecompressStream.Destroy;
@@ -2900,34 +2945,12 @@ end;
 
 function TZipCryptoEncryptStream.Write(const Buffer; Count: Integer): Integer;
 var
-  LBuf: TBytes;
-  LBlockSize: Integer;
   P: PByte;
 begin
-  Result := 0;
-  if (Count > BUF_SIZE) then
-    SetLength(LBuf, BUF_SIZE)
-  else
-    SetLength(LBuf, Count);
-
+  // 原地加密, 避免内存复制
   P := @Buffer;
-  while (Count > 0) do
-  begin
-    LBlockSize := Length(LBuf);
-    if Count < LBlockSize then
-      LBlockSize := Count;
-
-    // 取一块数据
-    Move(P^, LBuf[0], LBlockSize);
-    Inc(P, LBlockSize);
-
-    // 加密数据
-    FZipCrypto.Encrypt(@LBuf[0], LBlockSize);
-
-    // 将加密后的数据写入输出流中
-    Result := Result + FZipStream.Write(LBuf[0], LBlockSize);
-    Count := Count - LBlockSize;
-  end;
+  FZipCrypto.Encrypt(P, Count);
+  Result := FZipStream.Write(P^, Count);
 end;
 
 { TZipAESDecryptStream }
@@ -3023,7 +3046,11 @@ end;
 destructor TZipAESDecryptStream.Destroy;
 begin
   try
-    CheckHmac;
+    try
+      CheckHmac;
+    except
+      // 忽略析构函数中的异常, 避免资源泄漏
+    end;
   finally
     FreeAndNil(FAESCTREncryptor);
     FreeAndNil(FSha1Hmac);
@@ -3172,37 +3199,13 @@ end;
 
 function TZipAESEncryptStream.Write(const Buffer; Count: Integer): Integer;
 var
-  LBuf: TBytes;
-  LBlockSize: Integer;
   P: PByte;
 begin
-  Result := 0;
-  if (Count > BUF_SIZE) then
-    SetLength(LBuf, BUF_SIZE)
-  else
-    SetLength(LBuf, Count);
-
+  // 原地加密, 避免内存复制
   P := @Buffer;
-  while (Count > 0) do
-  begin
-    LBlockSize := Length(LBuf);
-    if Count < LBlockSize then
-      LBlockSize := Count;
-
-    // 取一块数据
-    Move(P^, LBuf[0], LBlockSize);
-    Inc(P, LBlockSize);
-
-    // 加密数据
-    FAESCTREncryptor.Execute(@LBuf[0], LBlockSize);
-
-    // 更新认证码
-    FSha1Hmac.Update(@LBuf[0], LBlockSize);
-
-    // 将加密后的数据写入输出流中
-    Result := Result + FZipStream.Write(LBuf[0], LBlockSize);
-    Count := Count - LBlockSize;
-  end;
+  FAESCTREncryptor.Execute(P, Count);
+  FSha1Hmac.Update(P, Count);
+  Result := FZipStream.Write(P^, Count);
 end;
 
 procedure TZipAESEncryptStream.WriteHmac;
