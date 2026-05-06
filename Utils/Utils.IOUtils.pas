@@ -83,7 +83,8 @@ type
     {$ENDIF}
   public
     class function OpenCreate(const AFileName: string): TFileStream; static;
-    class function OpenRead(const AFileName: string): TFileStream; static;
+    class function OpenRead(const AFileName: string;
+      const AShareMode: Word = fmShareDenyWrite): TFileStream; static;
     class function OpenWrite(const AFileName: string): TFileStream; static;
     class function CreateTempFile(const ATempPath: string = ''): TFileStream; static;
 
@@ -188,6 +189,7 @@ type
     EXTENDED_UNC_PREFIX: string = '\\?\UNC\';
     DIRECTORY_SEPARATOR_CHAR: Char = {$IFDEF MSWINDOWS}'\'{$ELSE}'/'{$ENDIF};
     EXTENSION_SEPARATOR_CHAR: Char = '.';
+    PATH_DELIMITERS = {$IFDEF MSWINDOWS}'/\:'{$ELSE}'/'{$ENDIF};
   public
     class function ChangeExtension(const APath, AExtension: string): string; static;
 
@@ -201,6 +203,7 @@ type
 
     class function GetExtension(const AFileName: string): string; static;
     class function GetFileName(const AFileName: string): string; static;
+    class function GetFilePath(const AFileName: string): string; static;
     class function GetFileNameWithoutExtension(const AFileName: string): string; static;
 
     class function GetFullPath(const APath: string): string; static;
@@ -213,6 +216,11 @@ type
     class function IsDriveRooted(const APath: string): Boolean; static;
     class function IsUNCRooted(const APath: string): Boolean; static;
     class function IsRelativePath(const APath: string): Boolean; static;
+
+    class function IsSamePath(const APath1, APath2: string): Boolean; static;
+    class function IsPathInBaseDir(const ABaseDir, APath: string): Boolean; static;
+    class function TryResolveLocalPath(const ABaseDir, APath: string;
+      out AResolvedPath: string): Boolean; static;
   end;
 
   TTempFileStream = class(TFastFileStream)
@@ -438,7 +446,7 @@ var
 begin
   if not Exists(ASrcFileName) then Exit(False);
 
-  LSrcStream := OpenRead(ASrcFileName);
+  LSrcStream := OpenRead(ASrcFileName, fmShareDenyNone);
   try
     LDstStream := OpenCreate(ADstFileName);
     try
@@ -544,9 +552,10 @@ begin
   Result := TFastFileStream.Create(AFileName, fmCreate or fmShareDenyWrite);
 end;
 
-class function TFileUtils.OpenRead(const AFileName: string): TFileStream;
+class function TFileUtils.OpenRead(const AFileName: string;
+  const AShareMode: Word): TFileStream;
 begin
-  Result := TFastFileStream.Create(AFileName, fmOpenRead or fmShareDenyWrite);
+  Result := TFastFileStream.Create(AFileName, fmOpenRead or AShareMode);
 end;
 
 class function TFileUtils.OpenWrite(const AFileName: string): TFileStream;
@@ -561,20 +570,28 @@ begin
 end;
 
 class function TFileUtils.ReadAllBytes(const AFileName: string): TBytes;
+const
+  CHUNK_SIZE = 8192;
 var
-  LFileStream: TFileStream;
-  LFileSize: Int64;
+  LHandle: THandle;
+  LBytesRead: Integer;
+  LTotal: Integer;
 begin
-  if not Exists(AFileName) then Exit(nil);
-
-  LFileStream := nil;
+  LHandle := FileOpen(AFileName, fmOpenRead or fmShareDenyNone);
+  if (LHandle < 0) then Exit(nil);
   try
-    LFileStream := OpenRead(AFileName);
-    LFileSize := LFileStream.Size;
-    SetLength(Result, LFileSize);
-    LFileStream.ReadBuffer(Result, Length(Result));
+    LTotal := 0;
+    Result := nil;
+    repeat
+      if (LTotal + CHUNK_SIZE > Length(Result)) then
+        SetLength(Result, LTotal + CHUNK_SIZE);
+      LBytesRead := FileRead(LHandle, Result[LTotal], CHUNK_SIZE);
+      if (LBytesRead > 0) then
+        Inc(LTotal, LBytesRead);
+    until (LBytesRead <= 0);
+    SetLength(Result, LTotal);
   finally
-    FreeAndNil(LFileStream);
+    FileClose(LHandle);
   end;
 end;
 
@@ -811,7 +828,7 @@ end;
 
 class function TFileStreamHelper.OpenRead(const AFileName: string): TFileStream;
 begin
-  Result := TFileUtils.OpenRead(AFileName);
+  Result := TFileUtils.OpenRead(AFileName, fmShareDenyNone);
 end;
 
 class function TFileStreamHelper.OpenWrite(
@@ -1382,7 +1399,7 @@ end;
 
 class function TPathUtils.GetDirectoryName(const AFileName: string): string;
 begin
-  Result := ExtractFileDir(AFileName);
+  Result := GetFilePath(AFileName);
 end;
 
 class function TPathUtils.GetExtension(const AFileName: string): string;
@@ -1405,8 +1422,25 @@ begin
 end;
 
 class function TPathUtils.GetFileName(const AFileName: string): string;
+var
+  I: Integer;
 begin
-  Result := ExtractFileName(AFileName);
+  I := LastDelimiter(PATH_DELIMITERS, AFileName);
+  if (I > 0) then
+    Result := Copy(AFileName, I + 1)
+  else
+    Result := AFileName;
+end;
+
+class function TPathUtils.GetFilePath(const AFileName: string): string;
+var
+  I: Integer;
+begin
+  I := LastDelimiter(PATH_DELIMITERS, AFileName);
+  if (I > 0) then
+    Result := Copy(AFileName, 1, I - 1)
+  else
+    Result := AFileName;
 end;
 
 class function TPathUtils.GetFileNameWithoutExtension(
@@ -1424,12 +1458,79 @@ begin
 end;
 
 class function TPathUtils.GetFullPath(const APath: string): string;
+var
+  LPath, LBasePath: string;
+  LParts: TArray<string>;
+  LStack: TArray<string>;
+  I, LStackLen: Integer;
+  LPart: string;
+  {$IFDEF MSWINDOWS}
+  LDrivePrefix: string;
+  {$ENDIF}
 begin
-  if IsRelativePath(APath) then
-    // 相对路径的文件名用程序所在路径补全
-    Result := Combine(TUtils.AppPath, APath)
+  {$IFDEF MSWINDOWS}
+  LPath := APath.Replace('/', '\');
+  {$ELSE}
+  LPath := APath;
+  {$ENDIF}
+
+  // 如果是相对路径，先与程序路径组合
+  if IsRelativePath(LPath) then
+    LBasePath := Combine(TUtils.AppPath, LPath)
   else
-    Result := APath;
+    LBasePath := LPath;
+  
+  {$IFDEF MSWINDOWS}
+  // Windows 下先提取盘符
+  if IsDriveRooted(LBasePath) then
+  begin
+    LDrivePrefix := Copy(LBasePath, 1, 2);
+    LBasePath := Copy(LBasePath, 3, MaxInt); // 移除盘符部分
+  end else
+    LDrivePrefix := '';
+  {$ENDIF}
+  
+  // 规范化路径，解析 .. 和 .
+  LParts := LBasePath.Split([PathDelim], TStringSplitOptions.ExcludeEmpty);
+  SetLength(LStack, Length(LParts));
+  LStackLen := 0;
+  
+  for I := 0 to High(LParts) do
+  begin
+    LPart := LParts[I];
+    
+    // 跳过当前目录符号
+    if (LPart = '.') then
+      Continue;
+    
+    // 处理上级目录符号
+    if (LPart = '..') then
+    begin
+      // 如果栈不为空，弹出一个目录
+      if (LStackLen > 0) then
+        Dec(LStackLen);
+    end else
+    begin
+      // 普通目录名，压入栈
+      LStack[LStackLen] := LPart;
+      Inc(LStackLen);
+    end;
+  end;
+  
+  // 重新组合路径
+  if (LStackLen = 0) then
+    Result := PathDelim
+  else
+  begin
+    SetLength(LStack, LStackLen);
+    Result := PathDelim + string.Join(PathDelim, LStack);
+  end;
+  
+  {$IFDEF MSWINDOWS}
+  // Windows 下添加盘符
+  if (LDrivePrefix <> '') then
+    Result := LDrivePrefix + Result;
+  {$ENDIF}
 end;
 
 class function TPathUtils.GetHomePath: string;
@@ -1440,7 +1541,7 @@ end;
 class function TPathUtils.IsDriveRooted(const APath: string): Boolean;
 begin
   {$IFDEF MSWINDOWS}
-  Result:=(Length(aPath) > 1)
+  Result:=(Length(APath) > 1)
     and CharInSet(APath[1], ['a'..'z', 'A'..'Z'])
     and (APath[2] = ':');
   {$ELSE}
@@ -1448,11 +1549,38 @@ begin
   {$ENDIF}
 end;
 
+class function TPathUtils.IsPathInBaseDir(const ABaseDir,
+  APath: string): Boolean;
+var
+  LBaseDir: string;
+begin
+  LBaseDir := IncludeTrailingPathDelimiter(ABaseDir);
+  Result := IsSamePath(Copy(APath, 1, Length(LBaseDir)), LBaseDir);
+end;
+
 class function TPathUtils.IsRelativePath(const APath: string): Boolean;
 begin
-  Result:= not APath.StartsWith(PathDelim)
-    and not IsDriveRooted(aPath)
-    and not IsUNCRooted(aPath);
+  // 空路径视为相对路径（当前目录）
+  if (APath = '') then
+    Exit(True);
+  
+  // 绝对路径的判断条件：
+  // 1. Windows: 盘符开头 (C:\) 或 UNC路径 (\\server\)
+  // 2. Linux/Unix: 以 / 开头
+  {$IFDEF MSWINDOWS}
+  Result := not IsDriveRooted(APath) and not IsUNCRooted(APath);
+  {$ELSE}
+  Result := not APath.StartsWith(PathDelim);
+  {$ENDIF}
+end;
+
+class function TPathUtils.IsSamePath(const APath1, APath2: string): Boolean;
+begin
+  {$IFDEF MSWINDOWS}
+  Result := SameText(APath1, APath2);
+  {$ELSE}
+  Result := (APath1 = APath2);
+  {$ENDIF}
 end;
 
 class function TPathUtils.IsUNCRooted(const APath: string): Boolean;
@@ -1471,6 +1599,32 @@ begin
     Result := True
   else
     Result := MatchesMask(AFileName, APattern);
+end;
+
+class function TPathUtils.TryResolveLocalPath(const ABaseDir, APath: string;
+  out AResolvedPath: string): Boolean;
+var
+  LBaseDir, LPath, LCombinedPath: string;
+begin
+  AResolvedPath := '';
+  LPath := APath;
+
+  if (Pos(#0, LPath) > 0) then Exit(False);
+
+  {$IFDEF MSWINDOWS}
+  LPath := LPath.Replace('/', '\');
+  if TPathUtils.IsDriveRooted(LPath)
+    or TPathUtils.IsUNCRooted(LPath)
+    or LPath.StartsWith('\') then Exit(False);
+  {$ELSE}
+  if LPath.StartsWith('/') then Exit(False);
+  {$ENDIF}
+
+  LBaseDir := TPathUtils.GetFullPath(ABaseDir);
+  LCombinedPath := TPathUtils.Combine(LBaseDir, LPath);
+  AResolvedPath := TPathUtils.GetFullPath(LCombinedPath);
+  Result := IsPathInBaseDir(LBaseDir, AResolvedPath)
+    or IsSamePath(LBaseDir, AResolvedPath);
 end;
 
 { TTempFileStream }
