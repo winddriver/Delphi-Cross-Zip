@@ -42,6 +42,7 @@ uses
   Classes,
   Math,
   Generics.Collections,
+  DateUtils,
   //ZLib,
   {$IFDEF DELPHI}
   ZLib,
@@ -73,8 +74,10 @@ const
   EXID_NTFS            = $000A; // NTFS 扩展时间戳字段标志
   EXID_UNIX            = $000D; // Unix 扩展字段标志
   EXID_TIMESTAMP       = $5455; // 扩展时间戳字段标志 (Extended Timestamp)
+  EXID_UNICODE_COMMENT = $6375; // Info-ZIP Unicode 注释扩展字段
+  EXID_UNICODE_PATH    = $7075; // Info-ZIP Unicode 路径扩展字段
   EXID_AES             = $9901; // AES 扩展字段标志
-  PBKDF2_ITERATIONS    = 1000;  // AES 密钥迭代次数
+  PBKDF2_ITERATIONS    = 1000;  // WinZip AES 标准固定 1000 次迭代（PKWARE AES 规范）
   
   // Unix 时间戳基准时间 (1970-01-01 00:00:00)
   UnixDateDelta        = 25569;  // Days between 1899-12-30 and 1970-01-01
@@ -293,6 +296,8 @@ type
     procedure SetFileComment(Index: Integer; const Value: string);
     procedure SetUtf8(const Value: Boolean);
 
+    procedure SetupHeaderFlags(const AHeader: PZipHeader);
+
     // 读取中心目录
     procedure ReadCentralHeader;
 
@@ -306,6 +311,8 @@ type
       const AStrategy: Integer = Z_DEFAULT_STRATEGY): Boolean;
 
     procedure FreeOwnedStream;
+    procedure OpenStream(const AZipFileStream: TStream;
+      const AOpenMode: TZipMode; const AOwned, AFreeOwnedOnError: Boolean);
     // 保存 Zip 文件
     procedure Save;
     function GetUtf8: Boolean;
@@ -319,6 +326,8 @@ type
     procedure ClearFiles;
     function RawToString(const ARaw: TBytes): string; overload;
     function RawToString(const ARaw: TBytes; const AIsUtf8: Boolean): string; overload;
+    function FileCommentToString(const AHeader: PZipHeader): string;
+    function FileNameToString(const AHeader: PZipHeader): string;
     function StringToRaw(const AStr: string): TBytes;
 
     function GetHasPassword: Boolean; virtual;
@@ -646,6 +655,11 @@ var
   FZipCompressionHandlers: TZipCompressionHandlerList = nil;
 
 type
+  IZipFinishable = interface
+    ['{B1C2E3F4-A5B6-7890-CDEF-1234567890AB}']
+    procedure Finish;
+  end;
+
   // 默认压缩处理类
   // 支持情况:
   //   压缩方式: Stored, Deflate
@@ -671,7 +685,7 @@ type
   end;
 
   // 存储方式(不压缩)的压缩流与解压缩流
-  TStoredStream = class(TStream)
+  TStoredStream = class(TStream, IZipFinishable)
   private
     FOwner: Boolean;
     FStream: TStream;
@@ -683,6 +697,11 @@ type
     function Read(var Buffer; Count: Longint): Longint; override;
     function Write(const Buffer; Count: Longint): Longint; override;
     function Seek(const Offset: Int64; Origin: TSeekOrigin): Int64; override;
+
+    // IInterface
+    function QueryInterface({$IFDEF FPC}constref{$ELSE}const{$ENDIF} IID: TGUID; out Obj): HResult; {$IF defined(FPC) and defined(POSIX)}cdecl{$ELSE}stdcall{$ENDIF};
+    function _AddRef: LongInt; {$IF defined(FPC) and defined(POSIX)}cdecl{$ELSE}stdcall{$ENDIF};
+    function _Release: LongInt; {$IF defined(FPC) and defined(POSIX)}cdecl{$ELSE}stdcall{$ENDIF};
   end;
 
   // Deflate压缩/解压流基础类
@@ -711,14 +730,14 @@ type
       const AStrategy: Integer = Z_DEFAULT_STRATEGY);
     destructor Destroy; override;
 
-    procedure Finish;
+    procedure Flush;
     function Read(var Buffer; Count: Longint): Longint; override;
     function Write(const Buffer; Count: Longint): Longint; override;
     function Seek(const Offset: Int64; Origin: TSeekOrigin): Int64; override;
   end;
 
   // Deflate解压流
-  TDeflateDecompressStream = class(TCustomDeflateStream)
+  TDeflateDecompressStream = class(TCustomDeflateStream, IZipFinishable)
   public
     constructor Create(const AStream: TStream; const AOwner: Boolean);
     destructor Destroy; override;
@@ -727,6 +746,11 @@ type
     function Read(var Buffer; Count: Longint): Longint; override;
     function Write(const Buffer; Count: Longint): Longint; override;
     function Seek(const Offset: Int64; Origin: TSeekOrigin): Int64; override;
+
+    // IInterface
+    function QueryInterface({$IFDEF FPC}constref{$ELSE}const{$ENDIF} IID: TGUID; out Obj): HResult; {$IF defined(FPC) and defined(POSIX)}cdecl{$ELSE}stdcall{$ENDIF};
+    function _AddRef: LongInt; {$IF defined(FPC) and defined(POSIX)}cdecl{$ELSE}stdcall{$ENDIF};
+    function _Release: LongInt; {$IF defined(FPC) and defined(POSIX)}cdecl{$ELSE}stdcall{$ENDIF};
   end;
 
   // zip传统加密类
@@ -892,6 +916,72 @@ begin
   Result := 0;
 end;
 
+// 定位指定ID的扩展字段数据
+function GetExtraFieldData(const AExtraData: TBytes; const AFieldId: Word;
+  out ADataOffset, AFieldLen: Integer): Boolean;
+var
+  LOffset: Integer;
+  LField: TZipExtraField;
+  LCount: Integer;
+  LDataOffset: Integer;
+begin
+  LOffset := 0;
+  LCount := Length(AExtraData);
+  while LOffset + SizeOf(TZipExtraField) <= LCount do
+  begin
+    Move(AExtraData[LOffset], LField, SizeOf(LField));
+    LDataOffset := LOffset + SizeOf(TZipExtraField);
+    if (LField.FieldLen > LCount - LDataOffset) then
+      raise EZipException.CreateRes(@SZipInvalidExtraField);
+
+    if LField.FieldId = AFieldId then
+    begin
+      ADataOffset := LDataOffset;
+      AFieldLen := LField.FieldLen;
+      Exit(True);
+    end;
+    Inc(LOffset, SizeOf(TZipExtraField) + LField.FieldLen);
+  end;
+
+  ADataOffset := 0;
+  AFieldLen := 0;
+  Result := False;
+end;
+
+function TryGetUnicodeExtraFieldText(const AExtraData, ARawData: TBytes;
+  const AFieldId: Word; out AText: string): Boolean;
+var
+  LDataOffset: Integer;
+  LFieldLen: Integer;
+  LTextBytes: TBytes;
+  LTextCrc32: UInt32;
+  LRawCrc32: UInt32;
+  LTextLen: Integer;
+begin
+  Result := False;
+  AText := '';
+
+  if not GetExtraFieldData(AExtraData, AFieldId, LDataOffset, LFieldLen)
+    or (LFieldLen <= SizeOf(UInt8) + SizeOf(UInt32))
+    or (AExtraData[LDataOffset] <> 1) then Exit;
+
+  Move(AExtraData[LDataOffset + SizeOf(UInt8)], LTextCrc32, SizeOf(LTextCrc32));
+
+  if Length(ARawData) > 0 then
+    LRawCrc32 := CRC32Calc(0, ARawData[0], Length(ARawData))
+  else
+    LRawCrc32 := 0;
+
+  if LTextCrc32 <> LRawCrc32 then Exit;
+
+  LTextLen := LFieldLen - SizeOf(UInt8) - SizeOf(UInt32);
+  SetLength(LTextBytes, LTextLen);
+  Move(AExtraData[LDataOffset + SizeOf(UInt8) + SizeOf(UInt32)],
+    LTextBytes[0], LTextLen);
+  AText := TEncoding.UTF8.GetString(LTextBytes);
+  Result := True;
+end;
+
 // 删除指定ID的扩展字段
 procedure DelExtraField(var AExtraData: TBytes; AFieldId: Word);
 var
@@ -973,86 +1063,64 @@ begin
   Move(AExtra^, AExtraData[LCount], AFieldLen);
 end;
 
+function IsZip64EndOfCentralHeader(const AEndHeader: TZipEndOfCentralHeader): Boolean;
+begin
+  Result := (AEndHeader.DiskNumber = MAX_UINT16) or
+     (AEndHeader.CentralDirStartDisk = MAX_UINT16) or
+     (AEndHeader.NumEntriesThisDisk = MAX_UINT16) or
+     (AEndHeader.CentralDirEntries = MAX_UINT16) or
+     (AEndHeader.CentralDirSize = MAX_UINT32) or
+     (AEndHeader.CentralDirOffset = MAX_UINT32);
+end;
+
 procedure RegisterZipCompressionHandler(const AClass: TZipCompressionHandlerClass);
 begin
   if (FZipCompressionHandlers.IndexOf(AClass) < 0) then
     FZipCompressionHandlers.Add(AClass);
 end;
 
-// 是否支持指定的压缩方式
-function SupportCompressionMethod(const AMethod: TZipCompressionMethod): Boolean;
+// 查找能处理指定压缩方式的 Handler
+function FindHandlerForMethod(const AMethod: TZipCompressionMethod): TZipCompressionHandlerClass;
 var
   I: Integer;
-  AComp: TZipCompressionHandlerClass;
 begin
-  Result := False;
   for I := 0 to FZipCompressionHandlers.Count - 1 do
   begin
-    AComp := TZipCompressionHandlerClass(FZipCompressionHandlers[I]);
-    if AComp <> nil then
-    begin
-      if AComp.CanHandleCompressionMethod(AMethod) then
-      begin
-        Result := True;
-        Exit;
-      end;
-    end;
+    Result := TZipCompressionHandlerClass(FZipCompressionHandlers[I]);
+    if (Result <> nil) and Result.CanHandleCompressionMethod(AMethod) then
+      Exit;
   end;
+  Result := nil;
+end;
+
+// 是否支持指定的压缩方式
+function SupportCompressionMethod(const AMethod: TZipCompressionMethod): Boolean;
+begin
+  Result := FindHandlerForMethod(AMethod) <> nil;
 end;
 
 function CreateCompressStreamFromHandler(const AMethod: TZipCompressionMethod;
   AOutStream: TStream; const AZipHeader: PZipHeader; const APassword: TBytes;
   const ACompressLevel, AStrategy: Integer): TStream;
 var
-  I: Integer;
-  LComp: TZipCompressionHandlerClass;
+  LHandler: TZipCompressionHandlerClass;
 begin
   Result := nil;
-  for I := 0 to FZipCompressionHandlers.Count - 1 do
-  begin
-    LComp := TZipCompressionHandlerClass(FZipCompressionHandlers[I]);
-    if LComp <> nil then
-    begin
-      if LComp.CanHandleCompressionMethod(AMethod) then
-      begin
-        Result := LComp.CreateCompressionStream(
-          AMethod,
-          AOutStream,
-          AZipHeader,
-          APassword,
-          ACompressLevel,
-          AStrategy);
-
-        Exit;
-      end;
-    end;
-  end;
+  LHandler := FindHandlerForMethod(AMethod);
+  if LHandler <> nil then
+    Result := LHandler.CreateCompressionStream(
+      AMethod, AOutStream, AZipHeader, APassword, ACompressLevel, AStrategy);
 end;
 
 function CreateDecompressStreamFromHandler(const AMethod: TZipCompressionMethod;
   const AInStream: TStream; const AZipHeader: PZipHeader; const APassword: TBytes): TStream;
 var
-  I: Integer;
-  LComp: TZipCompressionHandlerClass;
+  LHandler: TZipCompressionHandlerClass;
 begin
   Result := nil;
-  for I := 0 to FZipCompressionHandlers.Count - 1 do
-  begin
-    LComp := TZipCompressionHandlerClass(FZipCompressionHandlers[I]);
-    if LComp <> nil then
-    begin
-      if LComp.CanHandleCompressionMethod(AMethod) then
-      begin
-        Result := LComp.CreateDecompressionStream(
-          AMethod,
-          AInStream,
-          AZipHeader,
-          APassword);
-
-        Exit;
-      end;
-    end;
-  end;
+  LHandler := FindHandlerForMethod(AMethod);
+  if LHandler <> nil then
+    Result := LHandler.CreateDecompressionStream(AMethod, AInStream, AZipHeader, APassword);
 end;
 
 function ZipFileIsValid(const AFileName: string): Boolean;
@@ -1071,8 +1139,8 @@ begin
       FreeAndNil(LZipStream);
       FreeAndNil(LZipHeader);
     end;
-  except on E: EStreamError do
-    ;
+  except
+    on E: EZipException do ;
   end;
 end;
 
@@ -1153,6 +1221,10 @@ end;
 
 { TZipHeader }
 
+procedure SetZip64Field(AHeader: PZipHeader; const AValue: UInt64;
+  var AZip64Extra: TZip64ExtraHeader; var ARawField: UInt32;
+  const AFieldIndex: Integer); forward;
+
 function TZipHeader.GetCompressedSize64: UInt64;
 var
   LZip64Extra: TZip64ExtraHeader;
@@ -1229,7 +1301,7 @@ end;
 function TZipHeader.IsDirectory: Boolean;
 begin
   Result := (ExternalAttributes and faDirectory <> 0)
-    or ((Length(FileName) > 0) and (FileName[Length(FileName) - 1] in [Ord('\'), Ord('/')]));
+    or ((Length(FileName) > 0) and (FileName[High(FileName)] in [Ord('\'), Ord('/')]));
 end;
 
 function TZipHeader.IsUtf8FileName: Boolean;
@@ -1240,145 +1312,22 @@ end;
 procedure TZipHeader.SetCompressedSize64(const AValue: UInt64);
 var
   LZip64Extra: TZip64ExtraHeader;
-  LExSize: Integer;
 begin
-  LExSize := GetExtraField(
-    ExtraField,
-    EXID_ZIP64,
-    SizeOf(TZip64ExtraHeader),
-    @LZip64Extra);
-
-  if (AValue >= MAX_UINT32) or (LExSize >= SizeOf(UInt64)) then
-  begin
-    // 要支持 ZIP64, 需要解压库支持 45 版本及以上
-    if (MadeByVersion < 45) then
-      MadeByVersion := 45;
-    RequiredVersion := 45;
-    LZip64Extra.CompressedSize := AValue;
-    _CompressedSize := MAX_UINT32;
-
-    // 由于 LZip64Extra.CompressedSize 是第 2 个成员,
-    // 如果此时还未写入 LZip64Extra.UncompressedSize
-    // 应该将其补上
-    if (LExSize < 1 * SizeOf(UInt64)) then
-    begin
-      LZip64Extra.UncompressedSize := _UncompressedSize;
-      _UncompressedSize := MAX_UINT32;
-    end;
-
-    // ZIP64 扩展字段中只有第一个成员 UncompressedSize 是必须的
-    // 其它成员只有实际用到才需要写入
-    // CompressedSize 是其中的第1个成员, 所以如果要写入 CompressedSize
-    // 则扩展字段的尺寸至少应该是 2 * SizeOf(UInt64)
-    if (LExSize < 2 * SizeOf(UInt64)) then
-      LExSize := 2 * SizeOf(UInt64);
-  end else
-  begin
-    RequiredVersion := 20;
-    _CompressedSize := AValue;
-  end;
-
-  if (LExSize >= SizeOf(UInt64)) then
-  begin
-    SetExtraField(ExtraField, EXID_ZIP64, LExSize, @LZip64Extra);
-    ExtraFieldLength := Length(ExtraField);
-  end;
+  SetZip64Field(@Self, AValue, LZip64Extra, _CompressedSize, 2);
 end;
 
 procedure TZipHeader.SetLocalHeaderOffset64(const AValue: UInt64);
 var
   LZip64Extra: TZip64ExtraHeader;
-  LExSize: Integer;
 begin
-  LExSize := GetExtraField(
-    ExtraField,
-    EXID_ZIP64,
-    SizeOf(TZip64ExtraHeader),
-    @LZip64Extra);
-
-  if (AValue >= MAX_UINT32) or (LExSize >= SizeOf(UInt64)) then
-  begin
-    // 要支持 ZIP64, 需要解压库支持 45 版本及以上
-    if (MadeByVersion < 45) then
-      MadeByVersion := 45;
-    RequiredVersion := 45;
-    LZip64Extra.LocalHeaderOffset := AValue;
-    _LocalHeaderOffset := MAX_UINT32;
-
-    // 由于 LZip64Extra.LocalHeaderOffset 是第 3 个成员,
-    // 如果此时还未写入 LZip64Extra.UncompressedSize
-    // 应该将其补上
-    if (LExSize < 1 * SizeOf(UInt64)) then
-    begin
-      LZip64Extra.UncompressedSize := _UncompressedSize;
-      _UncompressedSize := MAX_UINT32;
-    end;
-
-    // 由于 LZip64Extra.LocalHeaderOffset 是第 3 个成员,
-    // 如果此时还未写入 LZip64Extra.CompressedSize
-    // 应该将其补上
-    if (LExSize < 2 * SizeOf(UInt64)) then
-    begin
-      LZip64Extra.CompressedSize := _CompressedSize;
-      _CompressedSize := MAX_UINT32;
-    end;
-
-    // ZIP64 扩展字段中只有第一个成员 UncompressedSize 是必须的
-    // 其它成员只有实际用到才需要写入
-    // LocalHeaderOffset 是其中的第3个成员, 所以如果要写入 LocalHeaderOffset
-    // 则扩展字段的尺寸至少应该是 3 * SizeOf(UInt64)
-    if (LExSize < 3 * SizeOf(UInt64)) then
-      LExSize := 3 * SizeOf(UInt64);
-  end else
-  begin
-    RequiredVersion := 20;
-    _LocalHeaderOffset := AValue;
-  end;
-
-  if (LExSize >= SizeOf(UInt64)) then
-  begin
-    SetExtraField(ExtraField, EXID_ZIP64, LExSize, @LZip64Extra);
-    ExtraFieldLength := Length(ExtraField);
-  end;
+  SetZip64Field(@Self, AValue, LZip64Extra, _LocalHeaderOffset, 3);
 end;
 
 procedure TZipHeader.SetUncompressedSize64(const AValue: UInt64);
 var
   LZip64Extra: TZip64ExtraHeader;
-  LExSize: Integer;
 begin
-  LExSize := GetExtraField(
-    ExtraField,
-    EXID_ZIP64,
-    SizeOf(TZip64ExtraHeader),
-    @LZip64Extra);
-
-  if (AValue >= MAX_UINT32) or (LExSize >= SizeOf(UInt64)) then
-  begin
-    // 要支持 ZIP64, 需要解压库支持 45 版本及以上
-    if (MadeByVersion < 45) then
-      MadeByVersion := 45;
-    RequiredVersion := 45;
-    LZip64Extra.UncompressedSize := AValue;
-    _UncompressedSize := MAX_UINT32;
-
-    // ZIP64 扩展字段中只有第一个成员 UncompressedSize 是必须的
-    // 其它成员只有实际用到才需要写入
-    // UncompressedSize 是其中的第1个成员, 所以如果要写入 UncompressedSize
-    // 则扩展字段的尺寸至少应该是 1 * SizeOf(UInt64)
-    if (LExSize < 1 * SizeOf(UInt64)) then
-      LExSize := 1 * SizeOf(UInt64);
-  end else
-  begin
-    RequiredVersion := 20;
-    _UncompressedSize := AValue;
-  end;
-
-  if (LExSize >= SizeOf(UInt64)) then
-  begin
-    SetExtraField(ExtraField, EXID_ZIP64, LExSize, @LZip64Extra);
-    ExtraFieldLength := Length(ExtraField);
-  end;
+  SetZip64Field(@Self, AValue, LZip64Extra, _UncompressedSize, 1);
 end;
 
 procedure TZipHeader.SetExtendedModTime(const AValue: TDateTime);
@@ -1403,6 +1352,60 @@ begin
   ExtraFieldLength := Length(ExtraField);
 end;
 
+procedure SetZip64Field(AHeader: PZipHeader; const AValue: UInt64;
+  var AZip64Extra: TZip64ExtraHeader; var ARawField: UInt32;
+  const AFieldIndex: Integer);
+var
+  LExSize: Integer;
+begin
+  LExSize := GetExtraField(
+    AHeader^.ExtraField,
+    EXID_ZIP64,
+    SizeOf(TZip64ExtraHeader),
+    @AZip64Extra);
+
+  if (AValue >= MAX_UINT32) or (LExSize >= SizeOf(UInt64)) then
+  begin
+    if (AHeader^.MadeByVersion < 45) then
+      AHeader^.MadeByVersion := 45;
+    AHeader^.RequiredVersion := 45;
+
+    ARawField := MAX_UINT32;
+
+    case AFieldIndex of
+      1: AZip64Extra.UncompressedSize := AValue;
+      2: AZip64Extra.CompressedSize := AValue;
+      3: AZip64Extra.LocalHeaderOffset := AValue;
+    end;
+
+    // 补齐前面缺失的 ZIP64 字段
+    if (AFieldIndex > 1) and (LExSize < 1 * SizeOf(UInt64)) then
+    begin
+      AZip64Extra.UncompressedSize := AHeader^._UncompressedSize;
+      AHeader^._UncompressedSize := MAX_UINT32;
+    end;
+    if (AFieldIndex > 2) and (LExSize < 2 * SizeOf(UInt64)) then
+    begin
+      AZip64Extra.CompressedSize := AHeader^._CompressedSize;
+      AHeader^._CompressedSize := MAX_UINT32;
+    end;
+
+    if LExSize < AFieldIndex * SizeOf(UInt64) then
+      LExSize := AFieldIndex * SizeOf(UInt64);
+  end else
+  begin
+    if LExSize < SizeOf(UInt64) then
+      AHeader^.RequiredVersion := 20;
+    ARawField := UInt32(AValue);
+  end;
+
+  if (LExSize >= SizeOf(UInt64)) then
+  begin
+    SetExtraField(AHeader^.ExtraField, EXID_ZIP64, LExSize, @AZip64Extra);
+    AHeader^.ExtraFieldLength := Length(AHeader^.ExtraField);
+  end;
+end;
+
 { TCrossZip }
 
 function TCrossZip.AddEmptyDir(const ADirName: string): Boolean;
@@ -1422,19 +1425,8 @@ begin
     Delete(LExistsIndex);
 
   NewHeader(LLocalHeader);
-  FillChar(LLocalHeader^, SizeOf(LLocalHeader^), 0);
 
-  LLocalHeader^.Flag := 0;
-  if Utf8 then
-    LLocalHeader^.Flag := LLocalHeader^.Flag or FLAG_UTF8;
-  if HasPassword then
-  begin
-    LLocalHeader^.Flag := LLocalHeader^.Flag or FLAG_PASSWORD;
-
-    // 设置 FLAG_DATA_DESCRIPTOR 标志让加密头不需要使用 CRC32 做校验码
-    // 这样可以方便一边读取数据一边计算 CRC32, 提高性能
-    LLocalHeader^.Flag := LLocalHeader^.Flag or FLAG_DATA_DESCRIPTOR;
-  end;
+  SetupHeaderFlags(LLocalHeader);
 
   LNow := Now;
 
@@ -1510,19 +1502,8 @@ begin
     Delete(LExistsIndex);
 
   NewHeader(LLocalHeader);
-  FillChar(LLocalHeader^, SizeOf(LLocalHeader^), 0);
 
-  LLocalHeader^.Flag := 0;
-  if Utf8 then
-    LLocalHeader^.Flag := LLocalHeader^.Flag or FLAG_UTF8;
-  if HasPassword then
-  begin
-    LLocalHeader^.Flag := LLocalHeader^.Flag or FLAG_PASSWORD;
-
-    // 设置 FLAG_DATA_DESCRIPTOR 标志让加密头不需要使用 CRC32 做校验码
-    // 这样可以方便一边读取数据一边计算 CRC32, 提高性能
-    LLocalHeader^.Flag := LLocalHeader^.Flag or FLAG_DATA_DESCRIPTOR;
-  end;
+  SetupHeaderFlags(LLocalHeader);
 
   LLocalHeader^.CompressionMethod := UInt16(ACompression);
   LLocalHeader^.ModifiedDateTime := AFileDateTime.ToDosDateTime;
@@ -1555,6 +1536,16 @@ end;
 
 function TCrossZip.AddStream(const AData: TStream;
   const ALocalHeader: PZipHeader; const ACompressLevel, AStrategy: Integer): Boolean;
+
+  procedure WriteLocalHeaderToStream;
+  begin
+    VerifyWrite(FZipStream, ALocalHeader^.RequiredVersion, SIZE_LOCAL_HEADER);
+    if ALocalHeader^.FileNameLength > 0 then
+      VerifyWrite(FZipStream, ALocalHeader^.FileName[0], ALocalHeader^.FileNameLength);
+    if ALocalHeader^.ExtraFieldLength > 0 then
+      VerifyWrite(FZipStream, ALocalHeader^.ExtraField[0], ALocalHeader^.ExtraFieldLength);
+  end;
+
 var
   LAESExtraField: TAESExtraField;
   LCompressStream: TStream;
@@ -1606,11 +1597,7 @@ begin
   // 写入本地文件头, 有部分属性还需要等数据压缩后重新计算
   // 由于本地文件头是在 TZipHeader.RequiredVersion 开始连续的 SIZE_LOCAL_HEADER 个字节
   // 所以可以一条命令全部写入, 不需要每个属性单独写一次
-  VerifyWrite(FZipStream, ALocalHeader^.RequiredVersion, SIZE_LOCAL_HEADER);
-  if ALocalHeader^.FileNameLength > 0 then
-    VerifyWrite(FZipStream, ALocalHeader^.FileName[0], ALocalHeader^.FileNameLength);
-  if ALocalHeader^.ExtraFieldLength > 0 then
-    VerifyWrite(FZipStream, ALocalHeader^.ExtraField[0], ALocalHeader^.ExtraFieldLength);
+  WriteLocalHeaderToStream;
 
   // 根据实际数据计算压缩后大小、未压缩大小、CRC32
   // 记录压缩数据流当前位置, 方便压缩数据写入后计算压缩大小
@@ -1640,7 +1627,7 @@ begin
     end;
 
     if LCompressStream is TDeflateCompressStream then
-      TDeflateCompressStream(LCompressStream).Finish;
+      TDeflateCompressStream(LCompressStream).Flush;
   finally
     FreeAndNil(LCompressStream);
   end;
@@ -1680,11 +1667,7 @@ begin
   // 重新写入计算后的属性
   // 由于zip64的相关属性在 ExtraField 中, 所以也需要重新写入
   // 由于 ExtraField 保存在 FileName 之后, 所以要先写入 FileName
-  VerifyWrite(FZipStream, ALocalHeader^.RequiredVersion, SIZE_LOCAL_HEADER);
-  if ALocalHeader^.FileNameLength > 0 then
-    VerifyWrite(FZipStream, ALocalHeader^.FileName[0], ALocalHeader^.FileNameLength);
-  if ALocalHeader^.ExtraFieldLength > 0 then
-    VerifyWrite(FZipStream, ALocalHeader^.ExtraField[0], ALocalHeader^.ExtraFieldLength);
+  WriteLocalHeaderToStream;
 
   FFileList.Add(ALocalHeader);
 
@@ -1716,6 +1699,12 @@ begin
     FZipFileName := '';
     if (FZipStream <> nil) then
       FreeAndNil(FZipStream);
+  end;
+  // 安全擦除密码
+  if (FPassword <> nil) then
+  begin
+    FillChar(FPassword[0], Length(FPassword), 0);
+    FPassword := nil;
   end;
 end;
 
@@ -1799,6 +1788,8 @@ begin
   inherited;
 end;
 
+procedure FinishAESIfNeeded(const AStream: TStream); forward;
+
 function TCrossZip.ExtractToStream(const AArchiveIndex: Integer;
   const ADstStream: TStream): Boolean;
 var
@@ -1810,6 +1801,7 @@ var
   LBlockSize: Integer;
   LCrc32: UInt32;
   LNeedCheckCrc32: Boolean;
+  LFinishable: IZipFinishable;
 begin
   Result := False;
   if (AArchiveIndex < 0)
@@ -1818,7 +1810,7 @@ begin
 
   LCentralHeader := FileInfo[AArchiveIndex];
 
-  FillChar(LZipHeader, SizeOf(TZipHeader), 0);
+  LZipHeader := Default(TZipHeader);
 
   // 定位到本地文件头
   FZipStream.Position := FStartFileData + Int64(LCentralHeader.LocalHeaderOffset);
@@ -1906,11 +1898,8 @@ begin
     if LNeedCheckCrc32 and (LCrc32 <> LZipHeader.CRC32) then
       raise EZipException.CreateRes(@SZipCrcError);
 
-    if LDecompressStream is TStoredStream then
-      TStoredStream(LDecompressStream).Finish
-    else
-    if LDecompressStream is TDeflateDecompressStream then
-      TDeflateDecompressStream(LDecompressStream).Finish;
+    if Supports(LDecompressStream, IZipFinishable, LFinishable) then
+      LFinishable.Finish;
   finally
     FreeAndNil(LDecompressStream);
   end;
@@ -1997,7 +1986,7 @@ function TCrossZip.ExtractToPath(const AArchiveIndex: Integer;
 var
   LZipHeader: PZipHeader;
   LIsDirectory: Boolean;
-  LDir, LFileName: string;
+  LDir, LFileName, LDstFileName: string;
 begin
   Result := False;
   if (AArchiveIndex < 0) or (AArchiveIndex >= FileCount) then Exit;
@@ -2008,13 +1997,13 @@ begin
   // 如果这条数据是个目录, 并且参数传了不要创建子目录, 那什么都不用做了
   if LIsDirectory and not ACreateSubdirs then Exit(True);
 
-  LFileName := RawToString(LZipHeader.FileName, LZipHeader.IsUtf8FileName);
+  LFileName := FileNameToString(LZipHeader);
   if (LFileName = '') then Exit;
 
-  if not BuildSafeExtractPath(ADstPath, LFileName, ACreateSubdirs, LFileName) then
+  if not BuildSafeExtractPath(ADstPath, LFileName, ACreateSubdirs, LDstFileName) then
     raise EZipException.CreateRes(@SZipInvalidExtractPath);
 
-  LDir := ExtractFileDir(LFileName);
+  LDir := ExtractFileDir(LDstFileName);
   if (LDir <> '') then
     ForceDirectories(LDir);
 
@@ -2022,7 +2011,7 @@ begin
   // 因为目录本身没有文件数据
   if LIsDirectory then Exit(True);
 
-  Result := ExtractToFile(AArchiveIndex, LFileName);
+  Result := ExtractToFile(AArchiveIndex, LDstFileName);
 end;
 
 function TCrossZip.GetComment: string;
@@ -2032,7 +2021,7 @@ end;
 
 function TCrossZip.GetFileComment(Index: Integer): string;
 begin
-  Result := RawToString(FileInfo[Index]^.FileComment, FileInfo[Index]^.IsUtf8FileName);
+  Result := FileCommentToString(FileInfo[Index]);
 end;
 
 function TCrossZip.GetFileCount: Integer;
@@ -2047,7 +2036,7 @@ end;
 
 function TCrossZip.GetFileName(Index: Integer): string;
 begin
-  Result := RawToString(FileInfo[Index]^.FileName, FileInfo[Index]^.IsUtf8FileName);
+  Result := FileNameToString(FileInfo[Index]);
 end;
 
 function TCrossZip.GetHasPassword: Boolean;
@@ -2100,7 +2089,7 @@ var
 begin
   for I := 0 to FileCount - 1 do
   begin
-    LFileName := RawToString(FileInfo[I].FileName, FileInfo[I].IsUtf8FileName);
+    LFileName := FileNameToString(FileInfo[I]);
     if ACaseSensitive then
     begin
       if LFileName = AArchiveName then
@@ -2116,10 +2105,17 @@ end;
 class procedure TCrossZip.NewHeader(var AHeader: PZipHeader);
 begin
   System.New(AHeader);
+  FillChar(AHeader^, SizeOf(AHeader^), 0);
 end;
 
 procedure TCrossZip.Open(const AZipFileStream: TStream;
   const AOpenMode: TZipMode; const AOwned: Boolean);
+begin
+  OpenStream(AZipFileStream, AOpenMode, AOwned, True);
+end;
+
+procedure TCrossZip.OpenStream(const AZipFileStream: TStream;
+  const AOpenMode: TZipMode; const AOwned, AFreeOwnedOnError: Boolean);
 begin
   Close;
 
@@ -2138,7 +2134,16 @@ begin
     // 读取中心目录文件头, 确定是不是有效的zip文件
     ReadCentralHeader;
   except
-    FZipStream := nil;
+    ClearFiles;
+    FChanged := False;
+    FOpenMode := zmRead;
+    FStartFileData := 0;
+    FEndFileData := 0;
+    if AOwned and AFreeOwnedOnError and (FZipStream <> nil) then
+      FreeAndNil(FZipStream)
+    else
+      FZipStream := nil;
+    FOwnedStream := False;
     raise;
   end;
 end;
@@ -2159,12 +2164,49 @@ begin
 
   LFileStream := TFileStream.Create(AZipFileName, LMode);
   try
-    Open(LFileStream, AOpenMode, True);
+    OpenStream(LFileStream, AOpenMode, True, False);
+    LFileStream := nil;
     FZipFileName := AZipFileName;
   except
     FreeAndNil(LFileStream);
     raise;
   end;
+end;
+
+function TCrossZip.FileCommentToString(const AHeader: PZipHeader): string;
+var
+  LComment: string;
+begin
+  if (AHeader <> nil)
+    and not AHeader^.IsUtf8FileName
+    and TryGetUnicodeExtraFieldText(
+      AHeader^.ExtraField,
+      AHeader^.FileComment,
+      EXID_UNICODE_COMMENT,
+      LComment) then Exit(LComment);
+
+  if AHeader <> nil then
+    Result := RawToString(AHeader^.FileComment, AHeader^.IsUtf8FileName)
+  else
+    Result := '';
+end;
+
+function TCrossZip.FileNameToString(const AHeader: PZipHeader): string;
+var
+  LName: string;
+begin
+  if (AHeader <> nil)
+    and not AHeader^.IsUtf8FileName
+    and TryGetUnicodeExtraFieldText(
+      AHeader^.ExtraField,
+      AHeader^.FileName,
+      EXID_UNICODE_PATH,
+      LName) then Exit(LName);
+
+  if AHeader <> nil then
+    Result := RawToString(AHeader^.FileName, AHeader^.IsUtf8FileName)
+  else
+    Result := '';
 end;
 
 function TCrossZip.RawToString(const ARaw: TBytes): string;
@@ -2178,6 +2220,21 @@ begin
     Result := TEncoding.UTF8.GetString(ARaw)
   else
     Result := TEncoding.Default.GetString(ARaw);
+end;
+
+procedure TCrossZip.SetupHeaderFlags(const AHeader: PZipHeader);
+begin
+  AHeader^.Flag := 0;
+  if Utf8 then
+    AHeader^.Flag := AHeader^.Flag or FLAG_UTF8;
+  if HasPassword then
+  begin
+    AHeader^.Flag := AHeader^.Flag or FLAG_PASSWORD;
+
+    // 设置 FLAG_DATA_DESCRIPTOR 标志让加密头不需要使用 CRC32 做校验码
+    // 这样可以方便一边读取数据一边计算 CRC32, 提高性能
+    AHeader^.Flag := AHeader^.Flag or FLAG_DATA_DESCRIPTOR;
+  end;
 end;
 
 procedure TCrossZip.ReadCentralHeader;
@@ -2198,12 +2255,7 @@ begin
     raise EZipException.CreateRes(@SZipInvalidZip);
 
   // 检查是不是ZIP64文件
-  if (LEndHeader.DiskNumber = MAX_UINT16) or
-     (LEndHeader.CentralDirStartDisk = MAX_UINT16) or
-     (LEndHeader.NumEntriesThisDisk = MAX_UINT16) or
-     (LEndHeader.CentralDirEntries = MAX_UINT16) or
-     (LEndHeader.CentralDirSize = MAX_UINT32) or
-     (LEndHeader.CentralDirOffset = MAX_UINT32) then
+  if IsZip64EndOfCentralHeader(LEndHeader) then
   begin
     VerifyRead(FZipStream, LEndHeader64.Signature, SizeOf(LEndHeader64));
     if (LEndHeader64.Signature <> SIGNATURE_ZIP64_END_HEADER) then
@@ -2403,9 +2455,6 @@ function TCrossZip.LocateEndOfCentralHeader(const AStream: TStream;
 var
   LEndHeaderAndSignatureSize, LBackRead, LMaxBack, LReadSize, I: Integer;
   LBackBuf: TBytes;
-  {$IFDEF DEBUG}
-  LReadTimes, LCmpTimes: Integer;
-  {$ENDIF}
 begin
   Result := False;
 
@@ -2424,10 +2473,6 @@ begin
   // 多读一点减少磁盘操作, 提升性能
   SetLength(LBackBuf, 50 * LEndHeaderAndSignatureSize);
   LBackRead := SizeOf(SIGNATURE_END_HEADER);
-  {$IFDEF DEBUG}
-  LReadTimes := 0;
-  LCmpTimes := 0;
-  {$ENDIF}
   while (LBackRead < LMaxBack) do
   begin
     // 下一块数据与上一块数据重叠 LEndHeaderAndSignatureSize 个字节
@@ -2445,16 +2490,10 @@ begin
 
     // 读数据块
     VerifyRead(AStream, LBackBuf[0], LReadSize);
-    {$IFDEF DEBUG}
-    Inc(LReadTimes);
-    {$ENDIF}
 
     // 查找结束标志
     for I := LReadSize - LEndHeaderAndSignatureSize downto 0 do
     begin
-      {$IFDEF DEBUG}
-      Inc(LCmpTimes);
-      {$ENDIF}
       // 检查结束文件头标志
       if (PCardinal(@LBackBuf[I])^ = SIGNATURE_END_HEADER) then
       begin
@@ -2473,12 +2512,7 @@ begin
           SetLength(FComment, 0);
 
         // 检查是不是ZIP64文件
-        if (AZipEndHeader.DiskNumber = MAX_UINT16) or
-           (AZipEndHeader.CentralDirStartDisk = MAX_UINT16) or
-           (AZipEndHeader.NumEntriesThisDisk = MAX_UINT16) or
-           (AZipEndHeader.CentralDirEntries = MAX_UINT16) or
-           (AZipEndHeader.CentralDirSize = MAX_UINT32) or
-           (AZipEndHeader.CentralDirOffset = MAX_UINT32) then
+        if IsZip64EndOfCentralHeader(AZipEndHeader) then
         begin
           // AStream.Size - LBackRead 是当前这块数据的偏移位置
           // 再 +I, 就是 SIGNATURE_END_HEADER 所在的位置
@@ -2733,10 +2767,33 @@ begin
   inherited;
 end;
 
+procedure FinishAESIfNeeded(const AStream: TStream);
+begin
+  if AStream is TZipAESDecryptStream then
+    TZipAESDecryptStream(AStream).Finish;
+end;
+
 procedure TStoredStream.Finish;
 begin
-  if FStream is TZipAESDecryptStream then
-    TZipAESDecryptStream(FStream).Finish;
+  FinishAESIfNeeded(FStream);
+end;
+
+function TStoredStream.QueryInterface({$IFDEF FPC}constref{$ELSE}const{$ENDIF} IID: TGUID; out Obj): HResult;
+begin
+  if GetInterface(IID, Obj) then
+    Result := S_OK
+  else
+    Result := E_NOINTERFACE;
+end;
+
+function TStoredStream._AddRef: LongInt;
+begin
+  Result := -1;
+end;
+
+function TStoredStream._Release: LongInt;
+begin
+  Result := -1;
 end;
 
 function TStoredStream.Read(var Buffer; Count: Integer): Longint;
@@ -2876,7 +2933,7 @@ begin
   end;
 end;
 
-procedure TDeflateCompressStream.Finish;
+procedure TDeflateCompressStream.Flush;
 var
   LZResult: Integer;
   LOutSize: Integer;
@@ -2982,8 +3039,25 @@ end;
 
 procedure TDeflateDecompressStream.Finish;
 begin
-  if FStream is TZipAESDecryptStream then
-    TZipAESDecryptStream(FStream).Finish;
+  FinishAESIfNeeded(FStream);
+end;
+
+function TDeflateDecompressStream.QueryInterface({$IFDEF FPC}constref{$ELSE}const{$ENDIF} IID: TGUID; out Obj): HResult;
+begin
+  if GetInterface(IID, Obj) then
+    Result := S_OK
+  else
+    Result := E_NOINTERFACE;
+end;
+
+function TDeflateDecompressStream._AddRef: LongInt;
+begin
+  Result := -1;
+end;
+
+function TDeflateDecompressStream._Release: LongInt;
+begin
+  Result := -1;
 end;
 
 function TDeflateDecompressStream.Read(var Buffer; Count: Longint): Longint;
@@ -3129,7 +3203,10 @@ begin
   if not LVerifyOK then
     raise EZipException.CreateRes(@SZipInvalidPassword);
 
-  FSize := AZipHeader^.CompressedSize - SIZE_ZIP_CRYPT_HEAD;
+  if AZipHeader^.CompressedSize < SIZE_ZIP_CRYPT_HEAD then
+    raise EZipException.CreateRes(@SZipInvalidZip);
+
+  FSize := AZipHeader^.CompressedSize - UInt64(SIZE_ZIP_CRYPT_HEAD);
   FPosStart := FZipStream.Position;
 end;
 
@@ -3236,11 +3313,23 @@ end;
 function TZipCryptoEncryptStream.Write(const Buffer; Count: Integer): Integer;
 var
   P: PByte;
+{$IFNDEF CONST_BUFFER_WRITABLE}
+  LLocalBuf: TBytes;
+{$ENDIF}
 begin
-  // 原地加密, 避免内存复制
+{$IFDEF CONST_BUFFER_WRITABLE}
+  // 原地加密, 避免内存复制 (x86/x64 平台 const 参数可写)
   P := @Buffer;
   FZipCrypto.Encrypt(P, Count);
   Result := FZipStream.Write(P^, Count);
+{$ELSE}
+  // 非 x86/x64 平台, const 参数可能在只读段, 复制到局部变量再加密
+  SetLength(LLocalBuf, Count);
+  Move(Buffer, LLocalBuf[0], Count);
+  P := @LLocalBuf[0];
+  FZipCrypto.Encrypt(P, Count);
+  Result := FZipStream.Write(P^, Count);
+{$ENDIF}
 end;
 
 { TZipAESDecryptStream }
@@ -3296,13 +3385,17 @@ begin
 
   // 根据盐值和密码生成密钥
   // 密钥结构: AES密钥+HMAC密钥+密码校验值
+  // WinZip AES 规范固定 1000 次迭代
   LKeyBuf := PBKDF2ToBytes(LSalt, APassword, PBKDF2_ITERATIONS, LKeySize * 2 + 2);
   if (LVerifyCode <> PWord(@LKeyBuf[LKeySize * 2])^) then
     raise EZipException.CreateRes(@SZipInvalidPassword);
 
   // 加密数据结构:
   // 盐值 + 2字节密码校验值 + AES加密数据 + 10字节认证码
-  FSize := AZipHeader^.CompressedSize - LSaltSize - 2{密码校验值} - 10{认证码(HMAC)};
+  if AZipHeader^.CompressedSize < UInt64(LSaltSize + 2{密码校验值} + 10{认证码(HMAC)}) then
+    raise EZipException.CreateRes(@SZipInvalidZip);
+
+  FSize := AZipHeader^.CompressedSize - UInt64(LSaltSize + 2{密码校验值} + 10{认证码(HMAC)});
   FPosStart := FZipStream.Position;
 
   // aes zip ctr 初始盐值所有元素为0
@@ -3331,6 +3424,11 @@ begin
   LHMACKey := Copy(LKeyBuf, LKeySize, LKeySize);
   FSha1Hmac := THashSHA1.Create;
   FSha1Hmac.HMACStart(LHMACKey);
+
+  // 安全擦除密钥缓冲区
+  FillChar(LSalt[0], Length(LSalt), 0);
+  FillChar(LKeyBuf[0], Length(LKeyBuf), 0);
+  FillChar(LHMACKey[0], Length(LHMACKey), 0);
 end;
 
 destructor TZipAESDecryptStream.Destroy;
@@ -3436,6 +3534,7 @@ begin
   // 根据盐值和密码生成密钥
   // 密钥结构: AES密钥(LKeySize字节) + HMAC密钥(LKeySize字节) + 密码校验值(2字节)
   LKeyBuf := PBKDF2ToBytes(LSalt, APassword, PBKDF2_ITERATIONS, LKeySize * 2 + 2);
+  // WinZip AES 规范固定 1000 次迭代
 
   // 密码校验值
   LVerifyCode := PWord(@LKeyBuf[LKeySize * 2])^;
@@ -3471,6 +3570,11 @@ begin
   LHMACKey := Copy(LKeyBuf, LKeySize, LKeySize);
   FSha1Hmac := THashSHA1.Create;
   FSha1Hmac.HMACStart(LHMACKey);
+
+  // 安全擦除密钥缓冲区
+  FillChar(LSalt[0], Length(LSalt), 0);
+  FillChar(LKeyBuf[0], Length(LKeyBuf), 0);
+  FillChar(LHMACKey[0], Length(LHMACKey), 0);
 end;
 
 destructor TZipAESEncryptStream.Destroy;
@@ -3497,12 +3601,25 @@ end;
 function TZipAESEncryptStream.Write(const Buffer; Count: Integer): Integer;
 var
   P: PByte;
+{$IFNDEF CONST_BUFFER_WRITABLE}
+  LLocalBuf: TBytes;
+{$ENDIF}
 begin
-  // 原地加密, 避免内存复制
+{$IFDEF CONST_BUFFER_WRITABLE}
+  // 原地加密, 避免内存复制 (x86/x64 平台 const 参数可写)
   P := @Buffer;
   FAESCTREncryptor.Execute(P, Count);
   FSha1Hmac.Update(P, Count);
   Result := FZipStream.Write(P^, Count);
+{$ELSE}
+  // 非 x86/x64 平台, const 参数可能在只读段, 复制到局部变量再加密
+  SetLength(LLocalBuf, Count);
+  Move(Buffer, LLocalBuf[0], Count);
+  P := @LLocalBuf[0];
+  FAESCTREncryptor.Execute(P, Count);
+  FSha1Hmac.Update(P, Count);
+  Result := FZipStream.Write(LLocalBuf[0], Count);
+{$ENDIF}
 end;
 
 procedure TZipAESEncryptStream.WriteHmac;
