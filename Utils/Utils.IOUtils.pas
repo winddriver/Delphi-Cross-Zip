@@ -82,11 +82,11 @@ type
     class function ConvertDateTimeToFileTime(const ADateTime: TDateTime): time_t; static;
     {$ENDIF}
   public
-    class function OpenCreate(const AFileName: string): TFileStream; static;
+    class function OpenCreate(const AFileName: string): TStream; static;
     class function OpenRead(const AFileName: string;
-      const AShareMode: Word = fmShareDenyWrite): TFileStream; static;
-    class function OpenWrite(const AFileName: string): TFileStream; static;
-    class function CreateTempFile(const ATempPath: string = ''): TFileStream; static;
+      const AShareMode: Word = fmShareDenyWrite): TStream; static;
+    class function OpenWrite(const AFileName: string): TStream; static;
+    class function CreateTempFile(const ATempPath: string = ''): TStream; static;
 
     class function ReadAllBytes(const AFileName: string): TBytes; static;
     class function ReadAllText(const AFileName: string; const AEncoding: TEncoding = nil): string; static;
@@ -231,14 +231,12 @@ type
     destructor Destroy; override;
   end;
 
-  TFileStreamHelper = class helper for TFileStream
-  public
-    class function OpenCreate(const AFileName: string): TFileStream; static; inline;
-    class function OpenRead(const AFileName: string): TFileStream; static; inline;
-    class function OpenWrite(const AFileName: string): TFileStream; static; inline;
-  end;
-
 implementation
+
+{$IFDEF POSIX}
+const
+  FileAccessRights = S_IRUSR or S_IWUSR or S_IRGRP or S_IWGRP or S_IROTH or S_IWOTH;
+{$ENDIF}
 
 {$IF DEFINED(MSWINDOWS) AND DEFINED(FPC)}
 function GetLogicalDriveStrings(nBufferLength: DWORD; lpBuffer: LPWSTR): DWORD; stdcall;
@@ -254,7 +252,7 @@ begin
   Create(AFilename, AMode, 0, ABufferSize);
 {$ELSEIF Defined(POSIX)}
   Create(AFilename, AMode,
-    S_IRUSR or S_IWUSR or S_IRGRP or S_IWGRP or S_IROTH or S_IWOTH,
+    FileAccessRights,
     ABufferSize);
 {$ENDIF POSIX}
 end;
@@ -461,7 +459,7 @@ begin
   Result := True;
 end;
 
-class function TFileUtils.CreateTempFile(const ATempPath: string): TFileStream;
+class function TFileUtils.CreateTempFile(const ATempPath: string): TStream;
 begin
   Result := TTempFileStream.Create(ATempPath);
 end;
@@ -545,20 +543,20 @@ begin
   Result := RenameFile(ASrcFileName, ADstFileName);
 end;
 
-class function TFileUtils.OpenCreate(const AFileName: string): TFileStream;
+class function TFileUtils.OpenCreate(const AFileName: string): TStream;
 begin
   if not FileExists(AFileName) then
-    TDirectoryUtils.CreateDirectory(ExtractFilePath(AFileName));
+    TDirectoryUtils.CreateDirectory(TPathUtils.GetFilePath(AFileName));
   Result := TFastFileStream.Create(AFileName, fmCreate or fmShareDenyWrite);
 end;
 
 class function TFileUtils.OpenRead(const AFileName: string;
-  const AShareMode: Word): TFileStream;
+  const AShareMode: Word): TStream;
 begin
   Result := TFastFileStream.Create(AFileName, fmOpenRead or AShareMode);
 end;
 
-class function TFileUtils.OpenWrite(const AFileName: string): TFileStream;
+class function TFileUtils.OpenWrite(const AFileName: string): TStream;
 begin
   if FileExists(AFileName) then
     Result := TFastFileStream.Create(AFileName, fmOpenReadWrite or fmShareDenyWrite)
@@ -578,7 +576,7 @@ var
   LTotal: Integer;
 begin
   LHandle := FileOpen(AFileName, fmOpenRead or fmShareDenyNone);
-  if (LHandle < 0) then Exit(nil);
+  if (LHandle = INVALID_HANDLE_VALUE) then Exit(nil);
   try
     LTotal := 0;
     Result := nil;
@@ -747,7 +745,7 @@ end;
 class procedure TFileUtils.WriteAllBytes(const AFileName: string;
   const ABytes: TBytes);
 var
-  LFileStream: TFileStream;
+  LFileStream: TStream;
 begin
   LFileStream := OpenCreate(AFileName);
   try
@@ -760,7 +758,7 @@ end;
 class procedure TFileUtils.WriteAllText(const AFileName, AContents: string;
   const AEncoding: TEncoding; const AWriteBOM: Boolean);
 var
-  LFileStream: TFileStream;
+  LFileStream: TStream;
   LEncoding: TEncoding;
   LBytes: TBytes;
 begin
@@ -786,7 +784,7 @@ end;
 class procedure TFileUtils.WriteAllStream(const AFileName: string;
   const AStream: TStream);
 var
-  LFileStream: TFileStream;
+  LFileStream: TStream;
 begin
   LFileStream := OpenCreate(AFileName);
   try
@@ -799,7 +797,7 @@ end;
 class procedure TFileUtils.AppendAllText(const AFileName, AContents: string;
   const AEncoding: TEncoding);
 var
-  LFileStream: TFileStream;
+  LFileStream: TStream;
   LEncoding: TEncoding;
   LBytes: TBytes;
 begin
@@ -816,25 +814,6 @@ begin
   finally
     FreeAndNil(LFileStream);
   end;
-end;
-
-{ TFileStreamHelper }
-
-class function TFileStreamHelper.OpenCreate(
-  const AFileName: string): TFileStream;
-begin
-  Result := TFileUtils.OpenCreate(AFileName);
-end;
-
-class function TFileStreamHelper.OpenRead(const AFileName: string): TFileStream;
-begin
-  Result := TFileUtils.OpenRead(AFileName, fmShareDenyNone);
-end;
-
-class function TFileStreamHelper.OpenWrite(
-  const AFileName: string): TFileStream;
-begin
-  Result := TFileUtils.OpenWrite(AFileName);
 end;
 
 { TDirectoryUtils }
