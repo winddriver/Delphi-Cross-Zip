@@ -364,7 +364,7 @@ type
 
     /// <summary>
     ///   关闭 Zip 文件, 同时会自动保存并清空条目列表. 文件名 Open 创建的内部文件流会在 Close 中释放.
-    ///   流 Open 传入且 AOwned=True 的流不会在 Close 中释放, 会在下次 Open 或析构时释放
+    ///   流 Open 传入且 AOwned=True 的流也会在 Close 中释放
     /// </summary>
     procedure Close;
 
@@ -1692,14 +1692,16 @@ begin
 
   // 文件名 Open 创建的内部文件流在 Close 中释放,
   // 防止外部代码在 Zip 对象释放前重新打开同一文件时被占用.
-  // 流 Open 传入且 AOwned=True 的流不在 Close 中释放,
-  // 保持 Close 后到下次 Open 或析构前仍可由外部代码访问.
   if (FZipFileName <> '') then
   begin
     FZipFileName := '';
     if (FZipStream <> nil) then
       FreeAndNil(FZipStream);
   end;
+
+  // 流 Open 传入且 AOwned=True 的流在 Close 中释放
+  FreeOwnedStream;
+
   // 安全擦除密码
   if (FPassword <> nil) then
   begin
@@ -1783,7 +1785,6 @@ destructor TCrossZip.Destroy;
 begin
   Close;
   FreeAndNil(FFileList);
-  FreeOwnedStream;
 
   inherited;
 end;
@@ -2117,10 +2118,8 @@ end;
 procedure TCrossZip.OpenStream(const AZipFileStream: TStream;
   const AOpenMode: TZipMode; const AOwned, AFreeOwnedOnError: Boolean);
 begin
+  // 先保存并关闭老的数据
   Close;
-
-  // 打开新的流之前先释放老的流
-  FreeOwnedStream;
 
   FZipStream := AZipFileStream;
   FOpenMode := AOpenMode;
